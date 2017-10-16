@@ -18,6 +18,8 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#define DOTS 0
+
 namespace {
 
 	typedef unsigned short VertexIndex;
@@ -108,6 +110,7 @@ static int totalNumPrimitives = 0;
 static Primitive *dev_primitives = NULL;
 static Fragment *dev_fragmentBuffer = NULL;
 static glm::vec3 *dev_framebuffer = NULL;
+static AABB *dev_aabbs = NULL;
 
 static int * dev_depth = NULL;	// you might need this buffer when doing depth test
 
@@ -600,6 +603,7 @@ void rasterizeSetBuffers(const tinygltf::Scene & scene) {
 	// 3. Malloc for dev_primitives
 	{
 		cudaMalloc(&dev_primitives, totalNumPrimitives * sizeof(Primitive));
+    cudaMalloc(&dev_aabbs, totalNumPrimitives * sizeof(AABB));
 	}
 	
 
@@ -638,10 +642,18 @@ void _vertexTransformAndAssembly(
 		// Multiply the MVP matrix for each vertex position, this will transform everything into clipping space
 		// Then divide the pos by its w element to transform into NDC space
 		// Finally transform x and y to viewport space
+    glm::vec4 w_pos(primitive.dev_position[vid], 1.0f);
+    glm::vec4 clip_pos = MVP * w_pos;
+    clip_pos /= clip_pos.w;
+    glm::vec4 eye_pos = MV * w_pos;
+    glm::vec3 eye_nor = MV_normal * primitive.dev_normal[vid];
 
 		// TODO: Apply vertex assembly here
-		// Assemble all attribute arraies into the primitive array
-		
+		// Assemble all attribute arrays into the primitive array
+    VertexOut* vOut = &primitive.dev_verticesOut[vid];
+    vOut->pos = clip_pos;
+    vOut->eyePos = glm::vec3(eye_pos);
+    vOut->eyeNor = eye_nor;
 	}
 }
 
@@ -660,12 +672,12 @@ void _primitiveAssembly(int numIndices, int curPrimitiveBeginId, Primitive* dev_
 		// TODO: uncomment the following code for a start
 		// This is primitive assembly for triangles
 
-		//int pid;	// id for cur primitives vector
-		//if (primitive.primitiveMode == TINYGLTF_MODE_TRIANGLES) {
-		//	pid = iid / (int)primitive.primitiveType;
-		//	dev_primitives[pid + curPrimitiveBeginId].v[iid % (int)primitive.primitiveType]
-		//		= primitive.dev_verticesOut[primitive.dev_indices[iid]];
-		//}
+		int pid;	// id for cur primitives vector
+		if (primitive.primitiveMode == TINYGLTF_MODE_TRIANGLES) {
+			pid = iid / (int)primitive.primitiveType;
+			dev_primitives[pid + curPrimitiveBeginId].v[iid % (int)primitive.primitiveType]
+				= primitive.dev_verticesOut[primitive.dev_indices[iid]];
+		}
 
 
 		// TODO: other primitive types (point, line)
@@ -673,16 +685,96 @@ void _primitiveAssembly(int numIndices, int curPrimitiveBeginId, Primitive* dev_
 	
 }
 
+__global__ void rasterize_points(int numPrimitives, int width, int height, Primitive* p, Fragment *fragments) {
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < numPrimitives) {
+    for (int i = 0; i < 3; ++i) {
+      glm::vec4 pos = p[index].v[i].pos;
+      glm::ivec2 pix_pos = (glm::vec2(pos) + glm::vec2(1, 1))*glm::vec2(width/2, height/2);
+      int fid = pix_pos.x + pix_pos.y * width;
+      fragments[fid].color = glm::vec3(1.0f);
+    }
+  }
+}
+
+/*__global__ void rasterize_wire(int numPrimitives, int height, int width, Primitive* p, Fragment *fragments) {
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < numPrimitives) {
+    for (int i = 0; i < 3; ++i) {
+      glm::vec4 pos = p[index].v[i].pos;
+      glm::ivec2 pix_pos = (glm::vec2(pos) + glm::vec2(1, 1))*glm::vec2(width/2, height/2);
+      int fid = pix_pos.x + pix_pos.y * width;
+      fragments[fid].color = glm::vec3(1.0f);
+    }
+  }
+}*/
+
+__device__ void convertToPixels(Primitive *p, glm::vec3 *tri, int width, int height) {
+  glm::vec3 pos;
+  pos = glm::vec3(p->v[0].pos);
+  tri[0] = (pos + glm::vec3(1, 1, 0)) * glm::vec3(width/2, height/2, 1);
+  pos = glm::vec3(p->v[1].pos);
+  tri[1] = (pos + glm::vec3(1, 1, 0)) * glm::vec3(width/2, height/2, 1);
+  pos = glm::vec3(p->v[2].pos);
+  tri[2] = (pos + glm::vec3(1, 1, 0)) * glm::vec3(width/2, height/2, 1);
+}
+
+__global__ void rasterizeTri(int width, int height, int start_x, int start_y,
+                             Primitive *p, Fragment *fragments, int index) {
+  //int index = blockIdx.x * blockDim.x + threadIdx.x;
+  int x = (blockIdx.x * blockDim.x) + threadIdx.x;
+  int y = (blockIdx.y * blockDim.y) + threadIdx.y;
+  if (x < width && y < height) {
+    /*for (int i = 0; i < 3; ++i) {
+      glm::vec4 pos = p[index].v[i].pos;
+      glm::ivec2 pix_pos = (glm::vec2(pos) + glm::vec2(1, 1))*glm::vec2(width/2, height/2);
+      int fid = pix_pos.x + pix_pos.y * width;
+      fragments[fid].color = glm::vec3(1.0f);
+    }*/
+    glm::vec3 tri[3];
+    convertToPixels(&p[index], tri, width, height);
+    glm::vec2 test_point = glm::vec2(start_x + x, start_y + y);
+    glm::vec3 bary = calculateBarycentricCoordinate(tri, test_point);
+    if (isBarycentricCoordInBounds(bary)) {
+      //glm::ivec2 pix_pos = (glm::vec2(test_point) + glm::vec2(1, 1))*glm::vec2(width/2, height/2);
+      int fid = test_point.x + test_point.y * width;
+      fragments[fid].color = glm::abs(p[index].v->eyeNor);
+    }
+
+  }
+}
+
+__global__ void computeAABBs(int numPrimitives, Primitive *p, AABB *aabbs,
+                             int width, int height) {
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < numPrimitives) {
+    glm::vec3 tri[3];
+    convertToPixels(&p[index], tri, width, height);
+    aabbs[index] = getAABBForTriangle(tri);
+  }
+}
+
+/*__global__ void rasterize(int numPrimitives, int height, int width,
+                          Primitive* p, Fragment *fragments) {
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < numPrimitives) {
+    glm::vec3 tri[3] = {glm::vec3(p[index].v[0].pos), 
+                        glm::vec3(p[index].v[1].pos),
+                        glm::vec3(p[index].v[2].pos)};
+    AABB aabb = getAABBForTriangle(tri);
+    raterizeTri<<<
+  }
+}*/
 
 
 /**
  * Perform rasterization.
  */
 void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const glm::mat3 MV_normal) {
-    int sideLength2d = 8;
-    dim3 blockSize2d(sideLength2d, sideLength2d);
-    dim3 blockCount2d((width  - 1) / blockSize2d.x + 1,
-		(height - 1) / blockSize2d.y + 1);
+  int sideLength2d = 8;
+  dim3 blockSize2d(sideLength2d, sideLength2d);
+  dim3 blockCount2d((width  - 1) / blockSize2d.x + 1,
+                    (height - 1) / blockSize2d.y + 1);
 
 	// Execute your rasterization pipeline here
 	// (See README for rasterization pipeline outline.)
@@ -702,10 +794,10 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 				dim3 numBlocksForVertices((p->numVertices + numThreadsPerBlock.x - 1) / numThreadsPerBlock.x);
 				dim3 numBlocksForIndices((p->numIndices + numThreadsPerBlock.x - 1) / numThreadsPerBlock.x);
 
-				_vertexTransformAndAssembly << < numBlocksForVertices, numThreadsPerBlock >> >(p->numVertices, *p, MVP, MV, MV_normal, width, height);
+				_vertexTransformAndAssembly<<<numBlocksForVertices, numThreadsPerBlock>>>(p->numVertices, *p, MVP, MV, MV_normal, width, height);
 				checkCUDAError("Vertex Processing");
 				cudaDeviceSynchronize();
-				_primitiveAssembly << < numBlocksForIndices, numThreadsPerBlock >> >
+				_primitiveAssembly<<<numBlocksForIndices, numThreadsPerBlock>>>
 					(p->numIndices, 
 					curPrimitiveBeginId, 
 					dev_primitives, 
@@ -720,18 +812,35 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 	}
 	
 	cudaMemset(dev_fragmentBuffer, 0, width * height * sizeof(Fragment));
-	initDepth << <blockCount2d, blockSize2d >> >(width, height, dev_depth);
+	initDepth<<<blockCount2d, blockSize2d>>>(width, height, dev_depth);
 	
 	// TODO: rasterize
+  dim3 numThreadsPerBlock = (128);
+  dim3 numBlocksForPrimitives = (totalNumPrimitives + numThreadsPerBlock.x - 1) / numThreadsPerBlock.x;
+#if DOTS
+  rasterize_points<<<numBlocksForPrimitives, numThreadsPerBlock>>>(totalNumPrimitives, width, height, dev_primitives, dev_fragmentBuffer);
+#else
+  computeAABBs<<<numBlocksForPrimitives, numThreadsPerBlock>>>(totalNumPrimitives, dev_primitives, dev_aabbs, width, height);
+  AABB *aabbs = (AABB *)malloc(sizeof(AABB) * totalNumPrimitives);
+  cudaMemcpy(aabbs, dev_aabbs, sizeof(AABB) * totalNumPrimitives, cudaMemcpyDeviceToHost);
+  cudaStream_t streams[16];
+  for (int i = 0; i < totalNumPrimitives; ++i) {
+    glm::vec3 max = aabbs[i].max;
+    glm::vec3 min = aabbs[i].min;
+    dim3 blockCountForRast((max.x - min.x - 1) / blockSize2d.x + 1,
+                      (max.y - min.y - 1) / blockSize2d.y + 1);
+    rasterizeTri<<<blockCountForRast, blockSize2d>>>(width, height, (int)min.x, (int)min.y, dev_primitives, dev_fragmentBuffer, i);
+  }
+#endif
 
 
 
-    // Copy depthbuffer colors into framebuffer
-	render << <blockCount2d, blockSize2d >> >(width, height, dev_fragmentBuffer, dev_framebuffer);
+  // Copy depthbuffer colors into framebuffer
+	render<<<blockCount2d, blockSize2d>>>(width, height, dev_fragmentBuffer, dev_framebuffer);
 	checkCUDAError("fragment shader");
-    // Copy framebuffer into OpenGL buffer for OpenGL previewing
-    sendImageToPBO<<<blockCount2d, blockSize2d>>>(pbo, width, height, dev_framebuffer);
-    checkCUDAError("copy render result to pbo");
+  // Copy framebuffer into OpenGL buffer for OpenGL previewing
+  sendImageToPBO<<<blockCount2d, blockSize2d>>>(pbo, width, height, dev_framebuffer);
+  checkCUDAError("copy render result to pbo");
 }
 
 /**
@@ -760,17 +869,20 @@ void rasterizeFree() {
 
 	////////////
 
-    cudaFree(dev_primitives);
-    dev_primitives = NULL;
+  cudaFree(dev_primitives);
+  dev_primitives = NULL;
+
+  cudaFree(dev_aabbs);
+  dev_aabbs = NULL;
 
 	cudaFree(dev_fragmentBuffer);
 	dev_fragmentBuffer = NULL;
 
-    cudaFree(dev_framebuffer);
-    dev_framebuffer = NULL;
+  cudaFree(dev_framebuffer);
+  dev_framebuffer = NULL;
 
 	cudaFree(dev_depth);
 	dev_depth = NULL;
 
-    checkCUDAError("rasterize Free");
+  checkCUDAError("rasterize Free");
 }
