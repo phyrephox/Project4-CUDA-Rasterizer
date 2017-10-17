@@ -112,7 +112,9 @@ static Fragment *dev_fragmentBuffer = NULL;
 static glm::vec3 *dev_framebuffer = NULL;
 static AABB *dev_aabbs = NULL;
 
-static int * dev_depth = NULL;	// you might need this buffer when doing depth test
+static int *dev_depth = NULL;	// you might need this buffer when doing depth test
+static float *dev_depth_f = NULL;
+static int *dev_depth_mutex = NULL ;
 
 /**
  * Kernel that writes the image to the OpenGL PBO directly.
@@ -168,6 +170,10 @@ void rasterizeInit(int w, int h) {
     
 	cudaFree(dev_depth);
 	cudaMalloc(&dev_depth, width * height * sizeof(int));
+  cudaFree(dev_depth_f);
+  cudaMalloc(&dev_depth_f, width * height * sizeof(float));
+	cudaFree(dev_depth_mutex);
+	cudaMalloc(&dev_depth_mutex, width * height * sizeof(int));
 
 	checkCUDAError("rasterizeInit");
 }
@@ -185,6 +191,18 @@ void initDepth(int w, int h, int * depth)
 	}
 }
 
+__global__
+void initDepth(int w, int h, float * depth)
+{
+	int x = (blockIdx.x * blockDim.x) + threadIdx.x;
+	int y = (blockIdx.y * blockDim.y) + threadIdx.y;
+
+	if (x < w && y < h)
+	{
+		int index = x + (y * w);
+		depth[index] = 10.0f; // depth buffer is 0-1 so 10 is way beyond max.
+	}
+}
 
 /**
 * kern function with support for stride to sometimes replace cudaMemcpy
@@ -644,14 +662,14 @@ void _vertexTransformAndAssembly(
 		// Finally transform x and y to viewport space
     glm::vec4 w_pos(primitive.dev_position[vid], 1.0f);
     glm::vec4 clip_pos = MVP * w_pos;
-    clip_pos /= clip_pos.w;
+    clip_pos /= -clip_pos.w;
     glm::vec4 eye_pos = MV * w_pos;
     glm::vec3 eye_nor = MV_normal * primitive.dev_normal[vid];
 
 		// TODO: Apply vertex assembly here
 		// Assemble all attribute arrays into the primitive array
     VertexOut* vOut = &primitive.dev_verticesOut[vid];
-    vOut->pos = clip_pos;
+    vOut->pos = clip_pos*glm::vec4(1,1,1,1);
     vOut->eyePos = glm::vec3(eye_pos);
     vOut->eyeNor = eye_nor;
 	}
@@ -720,8 +738,8 @@ __device__ void convertToPixels(Primitive *p, glm::vec3 *tri, int width, int hei
 }
 
 __global__ void rasterizeTri(int width, int height, int start_x, int start_y,
-                             Primitive *p, Fragment *fragments, int index) {
-  //int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int index, Primitive *p, Fragment *fragments, float *dev_depth/*,
+    int *dev_depth_mutex*/) {
   int x = (blockIdx.x * blockDim.x) + threadIdx.x;
   int y = (blockIdx.y * blockDim.y) + threadIdx.y;
   if (x < width && y < height) {
@@ -734,11 +752,32 @@ __global__ void rasterizeTri(int width, int height, int start_x, int start_y,
     glm::vec3 tri[3];
     convertToPixels(&p[index], tri, width, height);
     glm::vec2 test_point = glm::vec2(start_x + x, start_y + y);
-    glm::vec3 bary = calculateBarycentricCoordinate(tri, test_point);
-    if (isBarycentricCoordInBounds(bary)) {
-      //glm::ivec2 pix_pos = (glm::vec2(test_point) + glm::vec2(1, 1))*glm::vec2(width/2, height/2);
-      int fid = test_point.x + test_point.y * width;
-      fragments[fid].color = glm::abs(p[index].v->eyeNor);
+    if (test_point.x > width || test_point.x < 0 || test_point.y > height || test_point.y < 0);
+    else {
+      glm::vec3 bary = calculateBarycentricCoordinate(tri, test_point);
+      if (isBarycentricCoordInBounds(bary)) {
+        //glm::ivec2 pix_pos = (glm::vec2(test_point) + glm::vec2(1, 1))*glm::vec2(width/2, height/2);
+        int fid = test_point.x + test_point.y * width;
+        /*int *mutex = &dev_depth_mutex[fid];
+        bool is_set;
+        do {
+          is_set = (atomicCAS(mutex, 0, 1) == 0);
+          if (is_set) {
+            float depth = getZAtCoordinate(bary, tri);
+            if (depth < dev_depth[fid]) {
+              fragments[fid].color = glm::abs(p[index].v->eyeNor);
+              dev_depth[fid] = depth;
+            }
+            mutex = 0;
+          }
+        } while (!is_set);*/
+        float depth = getZAtCoordinate(bary, tri);
+        if (depth < dev_depth[fid]) {
+          fragments[fid].color = glm::abs(p[index].v->eyeNor);
+          //fragments[fid].color = glm::vec3(depth);
+          dev_depth[fid] = depth;
+        }
+      }
     }
 
   }
@@ -771,7 +810,7 @@ __global__ void computeAABBs(int numPrimitives, Primitive *p, AABB *aabbs,
  * Perform rasterization.
  */
 void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const glm::mat3 MV_normal) {
-  int sideLength2d = 8;
+  int sideLength2d = 16;
   dim3 blockSize2d(sideLength2d, sideLength2d);
   dim3 blockCount2d((width  - 1) / blockSize2d.x + 1,
                     (height - 1) / blockSize2d.y + 1);
@@ -812,7 +851,9 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 	}
 	
 	cudaMemset(dev_fragmentBuffer, 0, width * height * sizeof(Fragment));
-	initDepth<<<blockCount2d, blockSize2d>>>(width, height, dev_depth);
+	//initDepth<<<blockCount2d, blockSize2d>>>(width, height, dev_depth);
+	initDepth<<<blockCount2d, blockSize2d>>>(width, height, dev_depth_f);
+	cudaMemset(dev_depth_mutex, 0, width * height * sizeof(int));
 	
 	// TODO: rasterize
   dim3 numThreadsPerBlock = (128);
@@ -821,17 +862,34 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
   rasterize_points<<<numBlocksForPrimitives, numThreadsPerBlock>>>(totalNumPrimitives, width, height, dev_primitives, dev_fragmentBuffer);
 #else
   computeAABBs<<<numBlocksForPrimitives, numThreadsPerBlock>>>(totalNumPrimitives, dev_primitives, dev_aabbs, width, height);
+	checkCUDAError("aabbs");
   AABB *aabbs = (AABB *)malloc(sizeof(AABB) * totalNumPrimitives);
   cudaMemcpy(aabbs, dev_aabbs, sizeof(AABB) * totalNumPrimitives, cudaMemcpyDeviceToHost);
   cudaStream_t streams[16];
+  for (int i = 0; i < 16; ++i) {
+    cudaStreamCreate(&streams[i]);
+  }
   for (int i = 0; i < totalNumPrimitives; ++i) {
     glm::vec3 max = aabbs[i].max;
     glm::vec3 min = aabbs[i].min;
-    dim3 blockCountForRast((max.x - min.x - 1) / blockSize2d.x + 1,
-                      (max.y - min.y - 1) / blockSize2d.y + 1);
-    rasterizeTri<<<blockCountForRast, blockSize2d>>>(width, height, (int)min.x, (int)min.y, dev_primitives, dev_fragmentBuffer, i);
+    if (min.x > 800 || min.y > 800 || min.z > 0 || max.x < 0 || max.y < 0 || max.z < -1) continue;
+    max = glm::min(max, glm::vec3(800, 800, 0));
+    min = glm::max(min, glm::vec3(0, 0, -1));
+    dim3 blockCountForRast((max.x - min.x + blockSize2d.x - 1) / blockSize2d.x + 1,
+                           (max.y - min.y + blockSize2d.x - 1) / blockSize2d.y + 1);
+    rasterizeTri<<<blockCountForRast, blockSize2d, 0, streams[i%16]>>>
+        (width, height, (int)min.x, (int)min.y, i, dev_primitives,
+         dev_fragmentBuffer, dev_depth_f);// , dev_depth_mutex);
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (cudaSuccess != err) {
+      printf("tri error: %d (%d, %d)\n", i, blockCountForRast.x, blockCountForRast.y);
+    }
+    checkCUDAError("tri");
   }
 #endif
+  cudaDeviceSynchronize();
+	checkCUDAError("rasterize");
 
 
 
@@ -883,6 +941,12 @@ void rasterizeFree() {
 
 	cudaFree(dev_depth);
 	dev_depth = NULL;
+
+  cudaFree(dev_depth_f);
+  dev_depth_f = NULL;
+
+  cudaFree(dev_depth_mutex);
+  dev_depth_mutex = NULL;
 
   checkCUDAError("rasterize Free");
 }
