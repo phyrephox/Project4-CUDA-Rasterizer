@@ -45,10 +45,10 @@ namespace {
 
 		 glm::vec3 eyePos;	// eye space position used for shading
 		 glm::vec3 eyeNor;	// eye space normal used for shading, cuz normal will go wrong after perspective transformation
-		// glm::vec3 col;
+		 glm::vec3 col;
 		 glm::vec2 texcoord0;
 		 TextureData* dev_diffuseTex = NULL;
-		// int texWidth, texHeight;
+		 int texWidth, texHeight;
 		// ...
 	};
 
@@ -64,10 +64,10 @@ namespace {
 		// The attributes listed below might be useful, 
 		// but always feel free to modify on your own
 
-		// glm::vec3 eyePos;	// eye space position used for shading
-		// glm::vec3 eyeNor;
-		// VertexAttributeTexcoord texcoord0;
-		// TextureData* dev_diffuseTex;
+		glm::vec3 eyePos;	// eye space position used for shading
+		glm::vec3 eyeNor;
+		VertexAttributeTexcoord texcoord0;
+		TextureData* dev_diffuseTex;
 		// ...
 	};
 
@@ -146,12 +146,18 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer) {
     int x = (blockIdx.x * blockDim.x) + threadIdx.x;
     int y = (blockIdx.y * blockDim.y) + threadIdx.y;
     int index = x + (y * w);
+    glm::vec3 light_pos(5, 5, 10);
+    glm::vec3 light_col(1, 1, 1);
 
     if (x < w && y < h) {
-        framebuffer[index] = fragmentBuffer[index].color;
+      //framebuffer[index] = fragmentBuffer[index].color;
 
-		// TODO: add your fragment shader code here
+		  // TODO: add your fragment shader code here
 
+      //lambertian shading
+      glm::vec3 to_light = light_pos - fragmentBuffer[index].eyePos;
+      glm::vec3 col = glm::max(glm::vec3(0), glm::dot(glm::normalize(to_light), fragmentBuffer[index].eyeNor) * light_col) + glm::vec3(0.1);
+      framebuffer[index] = col*fragmentBuffer[index].color;
     }
 }
 
@@ -672,6 +678,11 @@ void _vertexTransformAndAssembly(
     vOut->pos = clip_pos*glm::vec4(1,1,1,1);
     vOut->eyePos = glm::vec3(eye_pos);
     vOut->eyeNor = eye_nor;
+    vOut->col = glm::vec3(1, 0, 0); //set color to red
+    vOut->dev_diffuseTex = primitive.dev_diffuseTex;
+    vOut->texcoord0 = primitive.dev_texcoord0[vid];
+    vOut->texWidth  = primitive.diffuseTexWidth;
+    vOut->texHeight = primitive.diffuseTexHeight;
 	}
 }
 
@@ -737,46 +748,138 @@ __device__ void convertToPixels(Primitive *p, glm::vec3 *tri, int width, int hei
   tri[2] = (pos + glm::vec3(1, 1, 0)) * glm::vec3(width/2, height/2, 1);
 }
 
-__global__ void rasterizeTri(int width, int height, int start_x, int start_y,
-    int index, Primitive *p, Fragment *fragments, float *dev_depth/*,
-    int *dev_depth_mutex*/) {
+__device__ void InterpolateTri(Primitive *p, glm::vec3 bary, Fragment *f, glm::vec3 tri[3], float z) {
+  f->color = (bary.x * p->v[0].col * tri[0].z +
+              bary.y * p->v[1].col * tri[1].z +
+              bary.z * p->v[2].col * tri[2].z) * -z;
+  f->eyePos = (bary.x * p->v[0].eyePos * tri[0].z +
+               bary.y * p->v[1].eyePos * tri[1].z +
+               bary.z * p->v[2].eyePos * tri[2].z) * -z;
+  f->eyeNor = (bary.x * p->v[0].eyeNor * tri[0].z +
+               bary.y * p->v[1].eyeNor * tri[1].z +
+               bary.z * p->v[2].eyeNor * tri[2].z) * -z;
+  f->texcoord0 = (bary.x * p->v[0].texcoord0 * tri[0].z +
+                  bary.y * p->v[1].texcoord0 * tri[1].z +
+                  bary.z * p->v[2].texcoord0 * tri[2].z) * -z;
+}
+
+__global__ void rasterizeTriNoShared(int width, int height, int start_x, int start_y,
+    int index, Primitive *p, Fragment *fragments, float *dev_depth,
+    int *dev_depth_mutex) {
   int x = (blockIdx.x * blockDim.x) + threadIdx.x;
   int y = (blockIdx.y * blockDim.y) + threadIdx.y;
   if (x < width && y < height) {
-    /*for (int i = 0; i < 3; ++i) {
-      glm::vec4 pos = p[index].v[i].pos;
-      glm::ivec2 pix_pos = (glm::vec2(pos) + glm::vec2(1, 1))*glm::vec2(width/2, height/2);
-      int fid = pix_pos.x + pix_pos.y * width;
-      fragments[fid].color = glm::vec3(1.0f);
-    }*/
     glm::vec3 tri[3];
     convertToPixels(&p[index], tri, width, height);
+    tri[0].z = 1 / tri[0].z; tri[1].z = 1 / tri[1].z; tri[2].z = 1 / tri[2].z;
     glm::vec2 test_point = glm::vec2(start_x + x, start_y + y);
-    if (test_point.x > width || test_point.x < 0 || test_point.y > height || test_point.y < 0);
+    if (test_point.x >= width || test_point.x < 0 || test_point.y >= height || test_point.y < 0);
     else {
       glm::vec3 bary = calculateBarycentricCoordinate(tri, test_point);
       if (isBarycentricCoordInBounds(bary)) {
-        //glm::ivec2 pix_pos = (glm::vec2(test_point) + glm::vec2(1, 1))*glm::vec2(width/2, height/2);
         int fid = test_point.x + test_point.y * width;
-        /*int *mutex = &dev_depth_mutex[fid];
+        int *mutex = &dev_depth_mutex[fid];
         bool is_set;
         do {
           is_set = (atomicCAS(mutex, 0, 1) == 0);
           if (is_set) {
-            float depth = getZAtCoordinate(bary, tri);
+            float depth = 1/getZAtCoordinate(bary, tri);
             if (depth < dev_depth[fid]) {
-              fragments[fid].color = glm::abs(p[index].v->eyeNor);
+              Fragment *f = &fragments[fid];
               dev_depth[fid] = depth;
+              InterpolateTri(&p[index], bary, f, tri, depth);
+              if (p[index].v[0].dev_diffuseTex == NULL) {
+                fragments[fid].color = p[index].v[0].col;
+              } else {
+                glm::vec2 texcoord = f->texcoord0*glm::vec2(p[index].v[0].texWidth, p[index].v[0].texHeight);
+                glm::ivec2 texcoord_min(texcoord);
+                glm::vec2 weights = texcoord - glm::vec2(texcoord_min);
+                int texWidth = p[index].v[0].texWidth;
+                glm::u8vec3* tex_colors = (glm::u8vec3*)p[index].v[0].dev_diffuseTex;
+                glm::vec3 col = glm::vec3(tex_colors[texcoord_min.x + texcoord_min.y * texWidth])/glm::vec3(255.0)*weights.x*weights.y +
+                                glm::vec3(tex_colors[texcoord_min.x + (texcoord_min.y + 1) * texWidth])/glm::vec3(255.0)*weights.x*(1-weights.y) +
+                                glm::vec3(tex_colors[texcoord_min.x + 1 + texcoord_min.y * texWidth])/glm::vec3(255.0)*(1-weights.x)*weights.y +
+                                glm::vec3(tex_colors[texcoord_min.x + 1 + (texcoord_min.y + 1) * texWidth])/glm::vec3(255.0)*(1-weights.x)*(1-weights.y);
+                fragments[fid].color = col;
+              }
             }
             mutex = 0;
           }
-        } while (!is_set);*/
-        float depth = getZAtCoordinate(bary, tri);
+        } while (!is_set);
+      }
+    }
+
+  }
+}
+
+__global__ void rasterizeTri(int width, int height, int start_x, int start_y,
+    int index, Primitive *primitives, Fragment *fragments, float *dev_depth,
+    int *dev_depth_mutex) {
+  __shared__ Primitive p;
+  int x = (blockIdx.x * blockDim.x) + threadIdx.x;
+  int y = (blockIdx.y * blockDim.y) + threadIdx.y;
+  if (threadIdx.x == 0 && threadIdx.y == 0) {
+    p = primitives[index];
+  }
+  __syncthreads();
+  if (x < width && y < height) {
+    glm::vec3 tri[3];
+    convertToPixels(&p, tri, width, height);
+    tri[0].z = 1 / tri[0].z; tri[1].z = 1 / tri[1].z; tri[2].z = 1 / tri[2].z;
+    glm::vec2 test_point = glm::vec2(start_x + x, start_y + y);
+    if (test_point.x >= width || test_point.x < 0 || test_point.y >= height || test_point.y < 0);
+    else {
+      glm::vec3 bary = calculateBarycentricCoordinate(tri, test_point);
+      if (isBarycentricCoordInBounds(bary)) {
+        int fid = test_point.x + test_point.y * width;
+        int *mutex = &dev_depth_mutex[fid];
+        bool is_set;
+        do {
+          is_set = (atomicCAS(mutex, 0, 1) == 0);
+          if (is_set) {
+            float depth = 1/getZAtCoordinate(bary, tri);
+            if (depth < dev_depth[fid]) {
+              Fragment *f = &fragments[fid];
+              dev_depth[fid] = depth;
+              InterpolateTri(&p, bary, f, tri, depth);
+              if (p.v[0].dev_diffuseTex == NULL) {
+                fragments[fid].color = p.v[0].col;
+              } else {
+                glm::vec2 texcoord = f->texcoord0*glm::vec2(p.v[0].texWidth, p.v[0].texHeight);
+                glm::ivec2 texcoord_min(texcoord);
+                glm::vec2 weights = texcoord - glm::vec2(texcoord_min);
+                int texWidth = p.v[0].texWidth;
+                glm::u8vec3* tex_colors = (glm::u8vec3*)p.v[0].dev_diffuseTex;
+                glm::vec3 col = glm::vec3(tex_colors[texcoord_min.x + texcoord_min.y * texWidth])/glm::vec3(255.0)*weights.x*weights.y +
+                                glm::vec3(tex_colors[texcoord_min.x + (texcoord_min.y + 1) * texWidth])/glm::vec3(255.0)*weights.x*(1-weights.y) +
+                                glm::vec3(tex_colors[texcoord_min.x + 1 + texcoord_min.y * texWidth])/glm::vec3(255.0)*(1-weights.x)*weights.y +
+                                glm::vec3(tex_colors[texcoord_min.x + 1 + (texcoord_min.y + 1) * texWidth])/glm::vec3(255.0)*(1-weights.x)*(1-weights.y);
+                fragments[fid].color = col;
+              }
+            }
+            mutex = 0;
+          }
+        } while (!is_set);
+        /*float depth = 1/getZAtCoordinate(bary, tri);
         if (depth < dev_depth[fid]) {
-          fragments[fid].color = glm::abs(p[index].v->eyeNor);
-          //fragments[fid].color = glm::vec3(depth);
+          Fragment *f = &fragments[fid];
           dev_depth[fid] = depth;
-        }
+          InterpolateTri(&p[index], bary, f, tri, depth);
+          if (p[index].v[0].dev_diffuseTex == NULL) {
+            fragments[fid].color = p[index].v[0].col;
+          } else {
+            glm::vec2 texcoord = f->texcoord0*glm::vec2(p[index].v[0].texWidth, p[index].v[0].texHeight);
+            glm::ivec2 texcoord_min(texcoord);
+            glm::vec2 weights = texcoord - glm::vec2(texcoord_min);
+            int texWidth = p[index].v[0].texWidth;
+            glm::u8vec3* tex_colors = (glm::u8vec3*)p[index].v[0].dev_diffuseTex;
+            glm::vec3 col = glm::vec3(tex_colors[texcoord_min.x + texcoord_min.y * texWidth])/glm::vec3(255.0)*weights.x*weights.y +
+                            glm::vec3(tex_colors[texcoord_min.x + (texcoord_min.y + 1) * texWidth])/glm::vec3(255.0)*weights.x*(1-weights.y) +
+                            glm::vec3(tex_colors[texcoord_min.x + 1 + texcoord_min.y * texWidth])/glm::vec3(255.0)*(1-weights.x)*weights.y +
+                            glm::vec3(tex_colors[texcoord_min.x + 1 + (texcoord_min.y + 1) * texWidth])/glm::vec3(255.0)*(1-weights.x)*(1-weights.y);
+            fragments[fid].color = col;
+          }
+        }*/
       }
     }
 
@@ -872,20 +975,21 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
   for (int i = 0; i < totalNumPrimitives; ++i) {
     glm::vec3 max = aabbs[i].max;
     glm::vec3 min = aabbs[i].min;
-    if (min.x > 800 || min.y > 800 || min.z > 0 || max.x < 0 || max.y < 0 || max.z < -1) continue;
-    max = glm::min(max, glm::vec3(800, 800, 0));
-    min = glm::max(min, glm::vec3(0, 0, -1));
+    //if (min.x > 800 || min.y > 800 || min.z > 0 || max.x < 0 || max.y < 0 || max.z < -1) continue;
+    if (min.x > 800 || min.y > 800 || max.x < 0 || max.y < 0) continue;
+    max = glm::min(max, glm::vec3(800, 800, 10));
+    min = glm::max(min, glm::vec3(0, 0, -10));
     dim3 blockCountForRast((max.x - min.x + blockSize2d.x - 1) / blockSize2d.x + 1,
                            (max.y - min.y + blockSize2d.x - 1) / blockSize2d.y + 1);
-    rasterizeTri<<<blockCountForRast, blockSize2d, 0, streams[i%16]>>>
+    rasterizeTri<<<blockCountForRast, blockSize2d, sizeof(Primitive), streams[i%16]>>>
         (width, height, (int)min.x, (int)min.y, i, dev_primitives,
-         dev_fragmentBuffer, dev_depth_f);// , dev_depth_mutex);
-    cudaDeviceSynchronize();
+         dev_fragmentBuffer, dev_depth_f , dev_depth_mutex);
+    /*cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
     if (cudaSuccess != err) {
       printf("tri error: %d (%d, %d)\n", i, blockCountForRast.x, blockCountForRast.y);
     }
-    checkCUDAError("tri");
+    checkCUDAError("tri");*/
   }
 #endif
   cudaDeviceSynchronize();
