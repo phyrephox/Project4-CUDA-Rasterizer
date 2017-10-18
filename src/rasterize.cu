@@ -151,13 +151,18 @@ void render(int w, int h, Fragment *fragmentBuffer, glm::vec3 *framebuffer) {
 
     if (x < w && y < h) {
       //framebuffer[index] = fragmentBuffer[index].color;
+      glm::vec3 fColor = fragmentBuffer[index].color;
+      if (fColor == glm::vec3(0)) {
+        framebuffer[index] = glm::vec3(0);
+      } else {
 
-		  // TODO: add your fragment shader code here
+        // TODO: add your fragment shader code here
 
-      //lambertian shading
-      glm::vec3 to_light = light_pos - fragmentBuffer[index].eyePos;
-      glm::vec3 col = glm::max(glm::vec3(0), glm::dot(glm::normalize(to_light), fragmentBuffer[index].eyeNor) * light_col) + glm::vec3(0.1);
-      framebuffer[index] = col*fragmentBuffer[index].color;
+        //lambertian shading
+        glm::vec3 to_light = light_pos - fragmentBuffer[index].eyePos;
+        glm::vec3 col = glm::max(glm::vec3(0), glm::dot(glm::normalize(to_light), fragmentBuffer[index].eyeNor) * light_col) + glm::vec3(0.1);
+        framebuffer[index] = col*fragmentBuffer[index].color;
+      }
     }
 }
 
@@ -778,11 +783,11 @@ __global__ void rasterizeTriNoShared(int width, int height, int start_x, int sta
       glm::vec3 bary = calculateBarycentricCoordinate(tri, test_point);
       if (isBarycentricCoordInBounds(bary)) {
         int fid = test_point.x + test_point.y * width;
-        int *mutex = &dev_depth_mutex[fid];
+        /*int *mutex = &dev_depth_mutex[fid];
         bool is_set;
         do {
           is_set = (atomicCAS(mutex, 0, 1) == 0);
-          if (is_set) {
+          if (is_set) {*/
             float depth = 1/getZAtCoordinate(bary, tri);
             if (depth < dev_depth[fid]) {
               Fragment *f = &fragments[fid];
@@ -803,9 +808,9 @@ __global__ void rasterizeTriNoShared(int width, int height, int start_x, int sta
                 fragments[fid].color = col;
               }
             }
-            mutex = 0;
+            /*mutex = 0;
           }
-        } while (!is_set);
+        } while (!is_set);*/
       }
     }
 
@@ -815,16 +820,16 @@ __global__ void rasterizeTriNoShared(int width, int height, int start_x, int sta
 __global__ void rasterizeTri(int width, int height, int start_x, int start_y,
     int index, Primitive *primitives, Fragment *fragments, float *dev_depth,
     int *dev_depth_mutex) {
-  __shared__ Primitive p;
+  extern __shared__ Primitive p[];
   int x = (blockIdx.x * blockDim.x) + threadIdx.x;
   int y = (blockIdx.y * blockDim.y) + threadIdx.y;
   if (threadIdx.x == 0 && threadIdx.y == 0) {
-    p = primitives[index];
+    *p = primitives[index];
   }
   __syncthreads();
   if (x < width && y < height) {
     glm::vec3 tri[3];
-    convertToPixels(&p, tri, width, height);
+    convertToPixels(p, tri, width, height);
     tri[0].z = 1 / tri[0].z; tri[1].z = 1 / tri[1].z; tri[2].z = 1 / tri[2].z;
     glm::vec2 test_point = glm::vec2(start_x + x, start_y + y);
     if (test_point.x >= width || test_point.x < 0 || test_point.y >= height || test_point.y < 0);
@@ -841,15 +846,15 @@ __global__ void rasterizeTri(int width, int height, int start_x, int start_y,
             if (depth < dev_depth[fid]) {
               Fragment *f = &fragments[fid];
               dev_depth[fid] = depth;
-              InterpolateTri(&p, bary, f, tri, depth);
-              if (p.v[0].dev_diffuseTex == NULL) {
-                fragments[fid].color = p.v[0].col;
+              InterpolateTri(p, bary, f, tri, depth);
+              if (p->v[0].dev_diffuseTex == NULL) {
+                fragments[fid].color = p->v[0].col;
               } else {
-                glm::vec2 texcoord = f->texcoord0*glm::vec2(p.v[0].texWidth, p.v[0].texHeight);
+                glm::vec2 texcoord = f->texcoord0*glm::vec2(p->v[0].texWidth, p->v[0].texHeight);
                 glm::ivec2 texcoord_min(texcoord);
                 glm::vec2 weights = texcoord - glm::vec2(texcoord_min);
-                int texWidth = p.v[0].texWidth;
-                glm::u8vec3* tex_colors = (glm::u8vec3*)p.v[0].dev_diffuseTex;
+                int texWidth = p->v[0].texWidth;
+                glm::u8vec3* tex_colors = (glm::u8vec3*)p->v[0].dev_diffuseTex;
                 glm::vec3 col = glm::vec3(tex_colors[texcoord_min.x + texcoord_min.y * texWidth])/glm::vec3(255.0)*weights.x*weights.y +
                                 glm::vec3(tex_colors[texcoord_min.x + (texcoord_min.y + 1) * texWidth])/glm::vec3(255.0)*weights.x*(1-weights.y) +
                                 glm::vec3(tex_colors[texcoord_min.x + 1 + texcoord_min.y * texWidth])/glm::vec3(255.0)*(1-weights.x)*weights.y +
@@ -857,29 +862,9 @@ __global__ void rasterizeTri(int width, int height, int start_x, int start_y,
                 fragments[fid].color = col;
               }
             }
-            mutex = 0;
+            *mutex = 0;
           }
         } while (!is_set);
-        /*float depth = 1/getZAtCoordinate(bary, tri);
-        if (depth < dev_depth[fid]) {
-          Fragment *f = &fragments[fid];
-          dev_depth[fid] = depth;
-          InterpolateTri(&p[index], bary, f, tri, depth);
-          if (p[index].v[0].dev_diffuseTex == NULL) {
-            fragments[fid].color = p[index].v[0].col;
-          } else {
-            glm::vec2 texcoord = f->texcoord0*glm::vec2(p[index].v[0].texWidth, p[index].v[0].texHeight);
-            glm::ivec2 texcoord_min(texcoord);
-            glm::vec2 weights = texcoord - glm::vec2(texcoord_min);
-            int texWidth = p[index].v[0].texWidth;
-            glm::u8vec3* tex_colors = (glm::u8vec3*)p[index].v[0].dev_diffuseTex;
-            glm::vec3 col = glm::vec3(tex_colors[texcoord_min.x + texcoord_min.y * texWidth])/glm::vec3(255.0)*weights.x*weights.y +
-                            glm::vec3(tex_colors[texcoord_min.x + (texcoord_min.y + 1) * texWidth])/glm::vec3(255.0)*weights.x*(1-weights.y) +
-                            glm::vec3(tex_colors[texcoord_min.x + 1 + texcoord_min.y * texWidth])/glm::vec3(255.0)*(1-weights.x)*weights.y +
-                            glm::vec3(tex_colors[texcoord_min.x + 1 + (texcoord_min.y + 1) * texWidth])/glm::vec3(255.0)*(1-weights.x)*(1-weights.y);
-            fragments[fid].color = col;
-          }
-        }*/
       }
     }
 
